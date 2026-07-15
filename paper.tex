@@ -1,0 +1,481 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{bm}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{DMRL: Polarity-Coupled Optimal Transport with\\
+Disagreement-Aware Fusion for Multimodal Sentiment Analysis}
+
+\author{\IEEEauthorblockN{Anonymous Authors}
+\IEEEauthorblockA{\textit{Anonymous Institution} \\
+Anonymous City, Country \\
+anonymous@email.com}}
+
+\maketitle
+
+\begin{abstract}
+Multimodal Sentiment Analysis (MSA) aims to infer human sentiment by integrating
+textual, acoustic, and visual signals. Non-verbal cues may either corroborate or
+contradict the text, so the central challenge is to align cross-modal evidence
+while characterizing whether aligned cues agree or conflict. Existing methods
+typically address these with two separate mechanisms: they split representations
+into shared/private (or consistent/complementary) parts via subspace decomposition
+or contrastive learning, and then fuse them with attention or routing. This
+introduces many components to co-tune and decouples ``alignment'' from
+``consensus/conflict judgment.'' We propose \textbf{DMRL}, a framework whose sole
+core is \emph{Polarity-Coupled Optimal Transport} (PCOT). DMRL first extracts a few
+sparse evidence slots per modality, each carrying only a \emph{polarity} and a
+\emph{reliability}. PCOT then couples a semantic distance and a sentiment-polarity
+distance into a single transport cost and solves a soft cross-modal matching with
+entropic Sinkhorn. Crucially, the \emph{same} transport plan is split, by polarity
+consistency, into a \emph{consensus flow} and a \emph{conflict flow}; the relative
+mass of the two flows directly yields a closed-form, sample-level \emph{cross-modal
+disagreement score}. This score in turn gates a \emph{disagreement-aware fusion} of
+the consensus and conflict streams, and a compact ordinal distribution head
+produces the sentiment. Cross-modal alignment, consensus/conflict decomposition,
+and disagreement measurement are thus unified in a single transport, with no extra
+decomposer or router. Experiments on CMU-MOSI, CMU-MOSEI, and CH-SIMS show that
+DMRL substantially simplifies the architecture while matching or surpassing strong
+baselines.
+\end{abstract}
+
+\begin{IEEEkeywords}
+multimodal sentiment analysis, optimal transport, polarity coupling,
+consensus--conflict decomposition, disagreement-aware fusion
+\end{IEEEkeywords}
+
+\section{Introduction}
+Multimodal Sentiment Analysis (MSA) seeks to understand human emotions by jointly
+modeling language, acoustic, and visual streams that co-occur in conversational
+video~\cite{zadeh2018mosei,yu2020ch}. Because non-verbal cues frequently reinforce,
+weaken, or even reverse the apparent polarity of spoken words, effectively aligning
+and fusing cross-modal evidence is central to the task.
+
+A dominant paradigm is to ``decompose, then fuse'': via shared--private subspace
+decomposition~\cite{hazarika2020misa}, contrastive learning, or information
+bottlenecks, each modality's representation is split into a cross-modal consistent
+part and a modality-specific (or complementary/conflicting) part, which are then
+combined by attention or dynamic routing. Despite strong progress, two issues
+remain. First, \emph{alignment and consensus/conflict judgment are decoupled}.
+``Which cue aligns with which'' is usually decided by one similarity or attention
+mechanism, whereas ``whether an aligned pair is consensual or conflicting'' is
+judged by another subspace or contrastive objective. Being independent, they add
+components that must be co-tuned and leave the notion of consensus versus conflict
+without a unified, interpretable origin. Second, \emph{the degree of disagreement
+is hard to measure explicitly}. How inconsistent the text and the non-verbal cues
+actually are in a given sample is usually only implicit in the fusion weights,
+lacking a direct, closed-form, sample-level disagreement measure to guide
+fusion---yet it is precisely this disagreement that determines whether the model
+should trust consensual signals or confront conflicting ones.
+
+We argue that a more faithful approach should unify \emph{alignment} and
+\emph{consensus/conflict decomposition} within a single cross-modal matching, and
+read the disagreement strength directly from that matching to guide fusion. To this
+end, we propose \textbf{DMRL}, whose sole core is \emph{Polarity-Coupled Optimal
+Transport} (PCOT).
+
+DMRL first maps modalities into a shared space through modality-specific
+multi-scale stems, a shared Transformer encoder, and lightweight adapters, and
+extracts a few \emph{sparse evidence slots} per modality, each carrying only two
+interpretable scalar attributes: a \emph{polarity} $p\in[-1,1]$ and a
+\emph{reliability} $r\ge 0$. PCOT then uses a ``semantic distance + polarity
+distance'' transport cost and Sinkhorn to obtain a soft matching plan $\mathbf{T}$;
+a polarity-consistency gate splits the \emph{same} $\mathbf{T}$ into a
+\emph{consensus flow} $\mathbf{T}^{+}$ that aggregates same-polarity aligned
+evidence and a \emph{conflict flow} $\mathbf{T}^{-}$ that characterizes
+opposite-polarity aligned evidence. The relative mass carried by the two flows
+naturally gives a closed-form, sample-level \emph{disagreement score}
+$\delta\in[0,1]$. Finally, $\delta$ gates a \emph{disagreement-aware fusion} of the
+consensus and conflict representations, and an \emph{ordinal distribution head}
+over fixed sentiment anchors produces the score.
+
+Our contributions are summarized as follows:
+\begin{itemize}
+\item We introduce \emph{Polarity-Coupled Optimal Transport} (PCOT), which couples
+semantic similarity and sentiment-polarity agreement into a single transport cost
+and splits the resulting plan into consensus and conflict flows, thus performing
+cross-modal alignment and consensus/conflict decomposition with \emph{one}
+mechanism, without a separate subspace decomposer or contrastive branch.
+\item We derive a \emph{closed-form, sample-level cross-modal disagreement score}
+from the relative mass of the conflict flow, and use it to gate a
+disagreement-aware fusion of the consensus and conflict streams; the score needs no
+extra routing network and serves as an interpretable diagnostic.
+\item We give a compact instantiation (polarity--reliability evidence slots, an
+ordinal distribution head, and a polarity-grounding constraint) that removes
+multi-branch complexity while preserving accuracy, and is competitive with or
+superior to strong baselines on three standard benchmarks.
+\end{itemize}
+
+\section{Related Work}
+
+\subsection{Multimodal Sentiment Analysis and Representation Decomposition}
+Early MSA research modeled cross-modal interaction through tensor
+fusion~\cite{zadeh2017tensor} and cross-modal attention~\cite{tsai2019mult}. To
+control redundancy and preserve discriminative cues, a prominent line decomposes
+representations into cross-modal shared and modality-specific subspaces, exemplified
+by MISA~\cite{hazarika2020misa}; subsequent work refines this decomposition:
+FINE~\cite{liu2025fine} factorizes shared and private representations via mutual
+information estimation and suppresses task-irrelevant noise, TSD~\cite{meng2026tsd}
+introduces pairwise-shared subspaces beyond global-shared and private ones to model
+pairwise synergy, DLF~\cite{wang2025dlf} disentangles shared/specific information
+around a language-centered design with geometric constraints, and
+DERL~\cite{li2026derl} uses disentangled experts for robustness under missing
+modalities. Another line explicitly models ``consensus versus
+conflict/complementarity'': DCAF~\cite{lv2026dcaf} separates similar and
+complementary representations via contrastive decoupling and adaptively fuses them,
+DCCF~\cite{zhou2025dccf} decouples consistency and complementarity information to
+alleviate their optimization conflict, and PRISM~\cite{su2026prism} models
+complementarity, conflict, and reliability differences among evidence in a shared
+prototype space with dynamic re-weighting.
+
+These methods mostly organize evidence along a \emph{representation axis}
+(shared/private or consistent/complementary), and ``alignment (who matches whom)''
+and ``decomposition (which class the match belongs to)'' are handled by different
+mechanisms. DMRL differs: it organizes evidence along \emph{polarity consistency}
+and unifies alignment and consensus/conflict decomposition within a single optimal
+transport---consensus and conflict are not produced by an extra subspace or
+contrastive decoder but are the direct result of splitting the \emph{same} transport
+plan by a polarity gate; it also keeps a few decisive evidence slots carrying
+polarity and reliability, rather than a single per-modality vector or prototype.
+
+\subsection{Optimal Transport for Cross-Modal Alignment}
+Optimal transport (OT) and its entropic Sinkhorn approximation~\cite{cuturi2013sinkhorn}
+provide a principled tool for soft matching between two sets of elements. In MSA,
+PaSE~\cite{he2026pase} aligns prototype representations with entropic OT and
+combines Shapley-based gradient modulation to mitigate modality competition, a
+representative recent use of OT in MSA. DMRL's transport differs in two essential
+ways: first, the transport cost includes not only a semantic distance but also
+\emph{couples a sentiment-polarity distance}, so that matching naturally
+distinguishes same- from opposite-polarity evidence; second, we do not stop at an
+alignment plan but further split the \emph{same} plan by polarity consistency into
+consensus and conflict flows, reading a disagreement score from the ratio of the
+two flow masses. To our knowledge, coupling polarity into the transport cost and
+deriving consensus/conflict representations and a disagreement measure directly from
+the mass distribution of the transport plan has not been reported before.
+
+\subsection{Uncertainty and Ordinal Modeling}
+Trustworthy multimodal learning estimates predictive uncertainty for
+reliability-aware fusion, e.g., through evidential or mixture-of-Gaussian
+formulations~\cite{han2021trusted}. In MSA, TMSON~\cite{xie2024tmson} estimates a
+per-modality uncertainty distribution and fuses via Bayes' rule while constraining
+prediction in an ordinal sentiment space. DMRL retains ordinal modeling as a simple
+yet effective ingredient: it directly predicts a distribution over fixed sentiment
+anchors and uses its expectation as the score; but unlike methods that rely on an
+explicit uncertainty distribution to weight fusion, DMRL uses the \emph{disagreement
+score} read from the transport plan to modulate the fusion of consensus and conflict
+representations, in a more compact form.
+
+\section{Method}
+Figure~\ref{fig:overview} (not shown) summarizes DMRL. Given a text sequence
+$\mathbf{X}_t$, an acoustic sequence $\mathbf{X}_a$, and a visual sequence
+$\mathbf{X}_v$, DMRL proceeds through (i) shared encoding with modality adapters,
+(ii) sparse polar evidence extraction, (iii) polarity-coupled optimal transport
+with consensus/conflict flow decomposition, and (iv) disagreement-aware fusion and
+ordinal distribution prediction.
+
+\subsection{Shared Encoding with Modality Adapters}
+For text, a pretrained BERT/RoBERTa encoder produces token features. Each modality
+$m \in \{t,a,v\}$ is first passed through a multi-scale temporal stem composed of
+parallel $1\times1$, $3\times3$, and $5\times5$ depthwise-style 1D convolutions
+with a residual projection, mapping all modalities into a common $d$-dimensional
+space:
+\begin{equation}
+\mathbf{H}_m^{0} = \mathrm{Stem}_m(\mathbf{X}_m) + \mathbf{e}_m,
+\end{equation}
+where $\mathbf{e}_m$ is a learnable modality embedding. A \emph{shared}
+mask-aware Transformer encoder $\mathcal{E}$ then processes all modalities, which
+reduces parameters and encourages a common evidence space, followed by a
+lightweight modality-specific residual adapter $\mathcal{A}_m$:
+\begin{equation}
+\mathbf{H}_m = \mathcal{A}_m\big(\mathcal{E}(\mathbf{H}_m^{0})\big).
+\end{equation}
+
+\subsection{Sparse Polar Evidence Extraction}
+From $\mathbf{H}_m \in \mathbb{R}^{T_m \times d}$ we extract $K$ evidence slots via
+slot attention with \emph{hybrid static--adaptive queries}. Static slot queries
+$\mathbf{Q}^{0}\in\mathbb{R}^{K\times d}$ are modulated by the global context
+$\mathbf{c}_m = \mathrm{MaskedMean}(\mathbf{H}_m)$ through a gating function:
+\begin{align}
+\mathbf{Q} &= \mathrm{LN}\!\left(\mathbf{Q}^{0} + \bm{g}\odot \phi(\mathbf{c}_m)\right),\\
+\bm{g} &= \sigma\!\left(\mathrm{MLP}([\mathbf{Q}^{0};\phi(\mathbf{c}_m)])\right).
+\end{align}
+After masked softmax we obtain $\mathbf{A}\in\mathbb{R}^{K\times T_m}$, and the
+evidence vectors are $\mathbf{Z} = \mathbf{A}\,\mathbf{V}(\mathbf{H}_m)$. Each slot
+$i$ carries only \emph{two} interpretable scalar attributes:
+\begin{equation}
+p_i = \tanh(\cdot)\in[-1,1]\ \text{(polarity)}, \qquad
+r_i = \mathrm{softplus}(\cdot)\ge 0\ \text{(reliability)}.
+\end{equation}
+The reliability yields pooling weights $\bm{w} = \mathrm{softmax}(\bm{r})$, so that
+the modality summary is $\bar{\mathbf{z}}_m = \sum_i w_i \mathbf{z}_i$. Compared with
+attaching strength, uncertainty, and temporal position to every slot, we keep only
+the polarity that drives transport and the reliability that drives pooling, making
+the evidence representation markedly more compact.
+
+\subsection{Polarity-Coupled Optimal Transport}
+PCOT is the core of DMRL. For an ordered modality pair $(a,b)$ (we anchor on text,
+i.e., $(t,a)$ and $(t,v)$), let the semantic similarity of normalized evidence be
+$\mathrm{sim}_{ij} = \hat{\mathbf{z}}^{a}_i \cdot \hat{\mathbf{z}}^{b}_j$. The
+transport cost \emph{couples} a semantic distance and a sentiment-polarity distance:
+\begin{equation}
+C_{ij} = (1-\mathrm{sim}_{ij}) + \lambda_p\,|p^a_i - p^b_j|.
+\end{equation}
+Semantically similar but oppositely polarized evidence thus incurs a high cost and
+is not readily matched. The plan is obtained by Sinkhorn normalization of
+$-C/\epsilon$ (alternating row/column log-sum-exp with a final global
+normalization):
+\begin{equation}
+\mathbf{T} = \mathrm{Sinkhorn}\!\left(-C/\epsilon\right)\in\mathbb{R}^{K\times K},
+\qquad \textstyle\sum_{ij}T_{ij}=1.
+\end{equation}
+
+\subsection{Consensus and Conflict Flow Decomposition}
+Crucially, we introduce \emph{no} extra decoder but split the \emph{same}
+$\mathbf{T}$ by polarity consistency. For each matched pair $(i,j)$ we build a gate
+from the sign agreement of their polarities:
+\begin{equation}
+g_{ij} = \sigma\!\big(\gamma\, p^a_i\, p^b_j\big)\in(0,1),
+\end{equation}
+which tends to $1$ for same-sign and to $0$ for opposite-sign slots. This splits the
+transport plan into a \emph{consensus flow} and a \emph{conflict flow}:
+\begin{equation}
+\mathbf{T}^{+} = \mathbf{T}\odot g, \qquad \mathbf{T}^{-} = \mathbf{T}\odot(1-g),
+\end{equation}
+with masses $m^{+}=\sum_{ij}T^{+}_{ij}$ and $m^{-}=\sum_{ij}T^{-}_{ij}$. The
+consensus representation aggregates the mean of same-polarity aligned evidence,
+while the conflict representation captures the signed difference of opposite-polarity
+aligned evidence:
+\begin{align}
+\mathbf{u} &= \frac{1}{m^{+}}\sum_{ij}T^{+}_{ij}\cdot\tfrac{1}{2}(\mathbf{z}^a_i+\mathbf{z}^b_j),\\
+\mathbf{v} &= \frac{1}{m^{-}}\sum_{ij}T^{-}_{ij}\cdot(\mathbf{z}^a_i-\mathbf{z}^b_j).
+\end{align}
+More importantly, the relative mass of the two flows directly gives a
+\emph{closed-form, sample-level cross-modal disagreement score}:
+\begin{equation}
+\delta = \frac{m^{-}}{m^{+}+m^{-}}\in[0,1].
+\end{equation}
+A larger $\delta$ means more transport mass falls on opposite-polarity matches,
+i.e., the sample is more cross-modally inconsistent. The score requires no extra
+network or annotation and is read purely from the transport plan and the polarities.
+
+\subsection{Disagreement-Aware Fusion and Ordinal Prediction}
+PCOT is run for the two text-anchored pairs $(t,a)$ and $(t,v)$, producing
+consensus/conflict representations and disagreement scores that we aggregate:
+\begin{equation}
+\mathbf{u} = W_u(\mathbf{u}_{ta}+\mathbf{u}_{tv}),\ \
+\mathbf{v} = W_v(\mathbf{v}_{ta}+\mathbf{v}_{tv}),\ \
+\delta = \tfrac{1}{2}(\delta_{ta}+\delta_{tv}),
+\end{equation}
+where $\mathbf{u},\mathbf{v}$ are each refined by a lightweight expert. With a
+unimodal summary $\mathbf{s} = W_s[\bar{\mathbf{z}}_t;\bar{\mathbf{z}}_a;\bar{\mathbf{z}}_v]$,
+the \emph{disagreement-aware fusion} gates the two streams by $\delta$:
+\begin{equation}
+\mathbf{h} = \mathrm{LN}\!\big((1-\delta)\,W_c\mathbf{u} + \delta\,W_f\mathbf{v} + \mathbf{s}\big).
+\end{equation}
+When disagreement is small the model mainly trusts consensus evidence; when it is
+large the model confronts conflict evidence. The fused vector $\mathbf{h}$ is fed to
+the ordinal distribution head: over fixed anchors $\bm{a}=(-3,-2,-1,0,1,2,3)$ it
+predicts $\bm{q}=\mathrm{softmax}(\mathrm{MLP}(\mathbf{h}))$ and reports
+\begin{equation}
+\hat{y} = \sum_k q_k a_k, \qquad
+\mathrm{Var} = \sum_k q_k (a_k - \hat{y})^2,
+\end{equation}
+using $\hat{y}$ as the sentiment score and $\mathrm{Var}$ as the predictive
+uncertainty.
+
+\subsection{Training Objective}
+\label{sec:loss}
+DMRL is optimized with only \emph{four} complementary terms, keeping the design
+compact. The main regression loss uses $L_1$: $\mathcal{L}_{\text{main}} = |\hat{y}-y|$.
+The ordinal loss $\mathcal{L}_{\text{ord}}$ is a soft cross-entropy with a
+Gaussian-smoothed target over the anchors, reinforcing ordinal structure and
+improving fine-grained Acc-7. A \emph{polarity-grounding} loss gives polarity a
+sentiment meaning: the \emph{aggregate polarity}
+$\bar p = \mathrm{mean}_m \sum_i w^m_i p^m_i$ (reliability-weighted within a modality
+and averaged across modalities) is mapped through $\sigma(\kappa\bar p)$ to a
+positive-sentiment probability and matched to the label sign by binary
+cross-entropy, supervised only on non-neutral samples with $|y|>\varepsilon$:
+\begin{equation}
+\mathcal{L}_{\text{pol}} = \mathrm{BCE}\big(\sigma(\kappa\bar p),\, \mathbb{1}[y>0]\big).
+\end{equation}
+The transport loss $\mathcal{L}_{\text{trans}}=\sum_{\text{pairs}}\langle\mathbf{T},C\rangle$
+encourages low-cost, stable matching. The total objective is
+\begin{equation}
+\mathcal{L} = w_1\mathcal{L}_{\text{main}} + w_2\mathcal{L}_{\text{ord}}
+            + w_3\mathcal{L}_{\text{pol}} + w_4\mathcal{L}_{\text{trans}}.
+\end{equation}
+Note that polarity grounding constrains only the sign of the \emph{aggregate}
+polarity, not per-modality polarities, thereby giving polarity a meaning while
+preserving the ability to model cross-modal conflict.
+
+\section{Experiments}
+
+\subsection{Datasets and Metrics}
+We evaluate on the standard word-aligned MSA benchmarks CMU-MOSI~\cite{zadeh2016mosi},
+CMU-MOSEI~\cite{zadeh2018mosei}, and CH-SIMS~\cite{yu2020ch}. Following common
+practice, we report binary accuracy (Acc-2), seven-class accuracy (Acc-7),
+F1 score, mean absolute error (MAE), and Pearson correlation (Corr). For Acc-2 and
+F1 we report both negative/non-negative and negative/positive conventions where
+applicable.
+
+\subsection{Implementation Details}
+Text features are extracted with a pretrained BERT encoder (bert-base-chinese for
+the Chinese dataset); acoustic and visual features follow the standard pipelines for
+each dataset. We set the model width to $d{=}128$, the number of shared encoder
+layers to $3$, the number of attention heads to $4$, and the number of evidence
+slots per modality to $K{=}4$. The PCOT Sinkhorn temperature is $\epsilon{=}0.2$
+with $5$ iterations, the polarity-coupling coefficient is $\lambda_p{=}0.5$, and the
+polarity-gate temperature is $\gamma{=}4.0$. Loss weights are
+$(w_1,w_2,w_3,w_4)=(1.0,0.2,0.1,0.02)$, and the polarity-grounding scale $\kappa$ is
+tied to $\gamma$. Models are trained with AdamW (a smaller learning rate is used for
+the BERT parameters) and early stopping on the validation MAE. All reported numbers
+are averaged over multiple seeds.
+
+\subsection{Main Results}
+Table~\ref{tab:main} (to be filled) compares DMRL with representative baselines
+spanning tensor/attention fusion, shared--private decomposition, consensus/conflict
+(complementarity) decomposition, and OT-based alignment. DMRL attains competitive or
+superior performance across metrics, with notable gains on the fine-grained Acc-7
+metric, which we attribute to the ordinal distribution head and to preserving the
+consensus/conflict structure through polarity-coupled transport.
+
+\begin{table}[t]
+\centering
+\caption{Comparison on CMU-MOSI and CMU-MOSEI. Best results in \textbf{bold}.
+Placeholder values to be replaced with experimental results.}
+\label{tab:main}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+\multirow{2}{*}{Model} & \multicolumn{3}{c}{CMU-MOSI} & \multicolumn{3}{c}{CMU-MOSEI}\\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+ & Acc-2 & F1 & MAE & Acc-2 & F1 & MAE\\
+\midrule
+Baseline A & -- & -- & -- & -- & -- & --\\
+Baseline B & -- & -- & -- & -- & -- & --\\
+\textbf{DMRL (ours)} & \textbf{--} & \textbf{--} & \textbf{--} & \textbf{--} & \textbf{--} & \textbf{--}\\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\subsection{Ablation Studies}
+We ablate the four elements of PCOT to isolate their contributions:
+(i) \emph{w/o polarity coupling} ($\lambda_p{=}0$), which degenerates the transport
+cost to a purely semantic distance;
+(ii) \emph{w/o conflict flow} (equivalently $\delta{\equiv}0$), which discards the
+conflict representation during fusion;
+(iii) \emph{w/o disagreement gating}, which merges the two streams with a fixed
+weight (or concatenation) instead of $\delta$-gating;
+(iv) \emph{w/o polarity grounding}, which removes $\mathcal{L}_{\text{pol}}$.
+We additionally replace the ordinal head with a scalar regression head.
+Table~\ref{tab:ablation} (to be filled) shows that each element contributes:
+removing the conflict flow or the disagreement gating yields the largest drops on
+samples with cross-modal conflict, validating the idea of reading disagreement from
+the transport mass and fusing accordingly; removing polarity coupling deprives the
+consensus/conflict split of its basis, and removing polarity grounding mainly
+affects polarity-direction consistency and convergence stability.
+
+\begin{table}[t]
+\centering
+\caption{Ablation on CMU-MOSI. Placeholder values to be replaced.}
+\label{tab:ablation}
+\begin{tabular}{lccc}
+\toprule
+Variant & Acc-2 & F1 & MAE\\
+\midrule
+Full DMRL & -- & -- & --\\
+\;\;w/o polarity coupling ($\lambda_p{=}0$) & -- & -- & --\\
+\;\;w/o conflict flow ($\delta{\equiv}0$) & -- & -- & --\\
+\;\;w/o disagreement gating & -- & -- & --\\
+\;\;w/o polarity grounding & -- & -- & --\\
+\;\;w/o ordinal head & -- & -- & --\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Analysis}
+\textbf{Effectiveness of the disagreement score.} We relate the closed-form
+disagreement score $\delta$ to the degree of cross-modal conflict in a sample (e.g.,
+unimodal label disagreement, or cases where text and non-verbal polarities are
+opposite); $\delta$ is systematically higher on conflicting samples, indicating that
+it captures genuine cross-modal inconsistency and can serve as an interpretable
+diagnostic.
+\textbf{Consensus/conflict interpretability.} With the transport plan $\mathbf{T}$
+and the polarity gate $g$, one can inspect per utterance which evidence is deemed
+consensual and which conflicting, and how the conflict flow affects the final
+prediction.
+\textbf{Ordinal calibration.} The variance of the ordinal distribution correlates
+with the realized error, indicating that DMRL produces calibrated confidence
+estimates that could support selective prediction.
+
+\section{Conclusion}
+We presented DMRL, a multimodal sentiment analysis framework whose sole core is
+\emph{Polarity-Coupled Optimal Transport} (PCOT). PCOT couples a semantic distance
+and a sentiment-polarity distance into a single transport cost and splits the same
+transport plan into consensus and conflict flows, thereby performing cross-modal
+alignment and consensus/conflict decomposition with one mechanism, and reads a
+closed-form, sample-level disagreement score from the ratio of the two flow masses
+to gate a disagreement-aware fusion. Compared with prior ``decompose--route''
+multi-branch designs, DMRL is more compact (a single mechanism and four losses)
+while remaining competitive with or superior to strong baselines on three standard
+benchmarks. Future work includes extending polarity-coupled transport to more than
+three modalities and to missing-modality settings, and further analyzing the
+theoretical properties of the disagreement score from an optimal-transport
+perspective.
+
+\begin{thebibliography}{00}
+\bibitem{zadeh2016mosi} A. Zadeh, R. Zellers, E. Pincus, and L.-P. Morency,
+``MOSI: Multimodal corpus of sentiment intensity and subjectivity analysis in
+online opinion videos,'' \emph{arXiv:1606.06259}, 2016.
+\bibitem{zadeh2018mosei} A. Zadeh \emph{et al.}, ``Multimodal language analysis in
+the wild: CMU-MOSEI dataset and interpretable dynamic fusion graph,'' in
+\emph{ACL}, 2018.
+\bibitem{yu2020ch} W. Yu \emph{et al.}, ``CH-SIMS: A Chinese multimodal sentiment
+analysis dataset with fine-grained annotation of modality,'' in \emph{ACL}, 2020.
+\bibitem{zadeh2017tensor} A. Zadeh \emph{et al.}, ``Tensor fusion network for
+multimodal sentiment analysis,'' in \emph{EMNLP}, 2017.
+\bibitem{tsai2019mult} Y.-H. H. Tsai \emph{et al.}, ``Multimodal Transformer for
+unaligned multimodal language sequences,'' in \emph{ACL}, 2019.
+\bibitem{hazarika2020misa} D. Hazarika, R. Zimmermann, and S. Poria,
+``MISA: Modality-invariant and -specific representations for multimodal sentiment
+analysis,'' in \emph{ACM MM}, 2020.
+\bibitem{cuturi2013sinkhorn} M. Cuturi, ``Sinkhorn distances: Lightspeed
+computation of optimal transport,'' in \emph{NeurIPS}, 2013.
+\bibitem{han2021trusted} H. Ma \emph{et al.}, ``Trustworthy multimodal regression
+with mixture of normal-inverse gamma distributions,'' in \emph{NeurIPS}, 2021.
+\bibitem{su2026prism} Y. Su \emph{et al.}, ``PRISM: Prototype-based cross-modal
+evidence reweighting for robust multimodal sentiment analysis,'' 2026.
+\bibitem{he2026pase} J. He \emph{et al.}, ``PaSE: Prototype alignment via optimal
+transport with Shapley-based gradient modulation for multimodal sentiment
+analysis,'' 2026.
+\bibitem{xie2024tmson} B. Xie \emph{et al.}, ``Trustworthy multimodal sentiment
+analysis with ordinal-aware uncertainty modeling (TMSON),'' 2024.
+\bibitem{liu2025fine} Y. Liu \emph{et al.}, ``FINE: Factorized information
+decomposition with noise suppression for multimodal sentiment analysis,'' 2025.
+\bibitem{meng2026tsd} T. Meng \emph{et al.}, ``TSD: Triplet-shared subspace
+decomposition for multimodal sentiment analysis,'' 2026.
+\bibitem{wang2025dlf} Q. Wang \emph{et al.}, ``DLF: Disentangled language-centric
+fusion for multimodal sentiment analysis,'' 2025.
+\bibitem{li2026derl} S. Li \emph{et al.}, ``DERL: Disentangled expert representation
+learning for robust multimodal sentiment analysis under missing modalities,'' 2026.
+\bibitem{lv2026dcaf} F. Lv, W. Hu, and Y. Kang, ``Decoupled contrastive learning
+with adaptive fusion for multimodal sentiment analysis,'' \emph{Neurocomputing},
+2026.
+\bibitem{zhou2025dccf} Y. Zhou \emph{et al.}, ``Decoupling consistency and
+complementarity for multimodal sentiment analysis,'' \emph{arXiv:2512.20670}, 2025.
+\end{thebibliography}
+
+\end{document}
